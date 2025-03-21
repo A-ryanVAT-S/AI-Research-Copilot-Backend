@@ -1,7 +1,11 @@
+# .gitignore
 .venv/
 __pycache__/
 *.pyc
 *.pyo
-.files/
-.test_main.http/
-.idea/
+*.pyd
+.DS_Store
+.env
+models/
+files/
+test_main.http/
