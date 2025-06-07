@@ -13,19 +13,13 @@ TORCH_DTYPE = torch.float16 if DEVICE == 'cuda' else torch.float32
 BATCH_SIZE = 4
 MAX_LENGTH = 512
 
-# Valid language mappings
+# Valid language mappings - reduced to 6 languages
 LANGUAGE_MODEL_MAP = {
     "de": "de",  # German
     "es": "es",  # Spanish
     "fr": "fr",  # French
-    "it": "it",  # Italian
-    "pt": "pt",  # Portuguese
-    "zh": "zh",  # Chinese
     "ru": "ru",  # Russian
-    "nl": "nl",  # Dutch
     "ja": "ja",  # Japanese
-    "ko": "ko",  # Korean
-    "ar": "ar"   # Arabic
 }
 
 @lru_cache(maxsize=5)
@@ -47,30 +41,29 @@ def load_resources(target_lang: str):
             model_name,
             torch_dtype=TORCH_DTYPE
         ).to(DEVICE).eval()
+        logger.info(f"Successfully loaded model: {model_name}")
         return tokenizer, model
     except Exception as e:
         logger.error(f"Model loading failed: {str(e)}")
-        raise ValueError(f"Failed to load model for {target_lang}. Please try again later.")
+        raise RuntimeError(f"Failed to load translation model for {target_lang}. Error: {str(e)}")
 
 def translate_text_core(text, target_lang):
     """Translate text to specified language with proper error handling"""
-    print("Translating...")  # Print message when translation starts
+    print(f"Translating to {target_lang}...")  # Print message when translation starts
+    
     try:
         tokenizer, model = load_resources(target_lang)
-    except ValueError as e:
-        raise e
+    except Exception as e:
+        logger.error(f"Failed to load translation resources: {str(e)}")
+        raise RuntimeError(f"Translation service unavailable for {target_lang}. Please try again later.")
 
     try:
-        # Split into sentences for better handling
-        sentences = [s.strip() for s in text.split('. ') if s.strip()]
-
-        # Batch processing
-        translated = []
-        for i in range(0, len(sentences), BATCH_SIZE):
-            batch = sentences[i:i + BATCH_SIZE]
-
+        # For shorter texts (like summaries), use different processing
+        text = text.strip()
+        if len(text) < 500:  # Short text, likely a summary
+            # Process as single unit for better coherence
             inputs = tokenizer(
-                batch,
+                text,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -79,18 +72,49 @@ def translate_text_core(text, target_lang):
 
             outputs = model.generate(
                 **inputs,
-                num_beams=3,
+                num_beams=4,
                 early_stopping=True,
-                max_length=MAX_LENGTH
+                max_length=MAX_LENGTH,
+                length_penalty=1.0,
+                repetition_penalty=1.2,
+                do_sample=False
             )
 
-            translated_batch = tokenizer.batch_decode(
-                outputs,
-                skip_special_tokens=True
-            )
-            translated.extend(translated_batch)
+            return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        else:
+            # For longer texts, split into sentences
+            sentences = [s.strip() + '.' for s in text.split('. ') if s.strip()]
 
-        return ' '.join(translated)
+            # Batch processing
+            translated = []
+            for i in range(0, len(sentences), BATCH_SIZE):
+                batch = sentences[i:i + BATCH_SIZE]
+
+                inputs = tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=MAX_LENGTH
+                ).to(DEVICE)
+
+                outputs = model.generate(
+                    **inputs,
+                    num_beams=3,
+                    early_stopping=True,
+                    max_length=MAX_LENGTH,
+                    length_penalty=1.0,
+                    repetition_penalty=1.2
+                )
+
+                translated_batch = tokenizer.batch_decode(
+                    outputs,
+                    skip_special_tokens=True
+                )
+                translated.extend(translated_batch)
+
+            return ' '.join(translated)
 
     except Exception as e:
         logger.error(f"Translation error: {str(e)}")

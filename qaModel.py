@@ -4,6 +4,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.llms import CTransformers
 from langchain.chains import RetrievalQA
+import warnings
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub")
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 
 def load_pdf_text(file_path):
@@ -43,7 +48,7 @@ def initialize_qa_system(db):
             'max_new_tokens': 512,
             'temperature': 0.3,
             'context_length': 2048,
-            'threads': 8  # Use 8 CPU threads
+            'threads': 8  
         }
     )
 

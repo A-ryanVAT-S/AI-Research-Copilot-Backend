@@ -3,92 +3,81 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, HTTPException, Body
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict
 import torch
 
-# Import model components
 from translationModel import translate_text_core
 from summaryModel import summarize_text_optimized
 from qaModel import create_faiss_index, initialize_qa_system, load_pdf_text
 
-# Configuration
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "files"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI()
 
-# Add CORS middleware first
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]  # Add this line
+    expose_headers=["*"]
 )
 
-# Document storage and processing state
-document_store: Dict[str, Dict] = {}
+document_store = {}
 
-
-class QAResponse(BaseModel):
+class QARequest(BaseModel):
     question: str
-
 
 class TranslationRequest(BaseModel):
     target_lang: str
 
-
 @app.post("/api/upload")
 async def upload_file(file: UploadFile):
     try:
-        # Single validation check
         allowed_types = ["application/pdf", "text/plain"]
         if file.content_type not in allowed_types:
             return JSONResponse(
-                {"detail": "Only PDF/text files allowed"},
+                {"detail": "only pdf/text files allowed"},
                 status_code=400
             )
 
-        # Generate unique IDs and paths
         file_uuid = str(uuid.uuid4())
         file_ext = os.path.splitext(file.filename)[1]
         stored_filename = f"{file_uuid}{file_ext}"
         file_path = UPLOAD_DIR / stored_filename
 
-        # Save file to persistent storage
         content = await file.read()
 
-        # File size validation (10MB limit)
         if len(content) > 10 * 1024 * 1024:
             return JSONResponse(
-                {"detail": "File size exceeds 10MB limit"},
+                {"detail": "file size exceeds 10mb limit"},
                 status_code=400
             )
 
         with open(file_path, "wb") as buffer:
             buffer.write(content)
 
-        # Extract and store text
         text = load_pdf_text(str(file_path))
         if not text.strip():
-            raise ValueError("Failed to extract text from PDF")
+            raise ValueError("failed to extract text from pdf")
 
-        # # Delete the file after processing
-        # try:
-        #     os.remove(file_path)
-        # except Exception as e:
-        #     print(f"Error deleting file: {str(e)}")
+        print(f"processing document: {file.filename}")
+        
+        summary = summarize_text_optimized(text)
+        print("summary generated")
+        
+        faiss_index = create_faiss_index(text)
+        print("faiss index created")
 
-        # Store document metadata
         document_store[file_uuid] = {
             "text": text,
             "filename": file.filename,
-            "faiss_index": None,
+            "summary": summary,
+            "faiss_index": faiss_index,
             "translations": {},
             "created_at": datetime.now().isoformat()
         }
@@ -100,17 +89,15 @@ async def upload_file(file: UploadFile):
 
     except Exception as e:
         return JSONResponse(
-            {"detail": f"Upload failed: {str(e)}"},
+            {"detail": f"upload failed: {str(e)}"},
             status_code=500
         )
 
-
 @app.get("/api/file-info/{doc_id}")
 def get_file_info(doc_id: str):
-    """Get document metadata"""
     doc = document_store.get(doc_id)
     if not doc:
-        raise HTTPException(404, "Document not found")
+        raise HTTPException(404, "document not found")
 
     return JSONResponse({
         "doc_id": doc_id,
@@ -118,72 +105,55 @@ def get_file_info(doc_id: str):
         "upload_date": doc["created_at"]
     })
 
-
 @app.get("/api/analyze/{doc_id}")
 def get_summary(doc_id: str):
     doc = document_store.get(doc_id)
     if not doc:
-        raise HTTPException(404, "Document not found")
+        raise HTTPException(404, "document not found")
 
     try:
-        # Check if summary exists
-        if "summary" not in doc:
-            # Generate and store summary if missing
-            doc["summary"] = summarize_text_optimized(doc["text"])
-
         return JSONResponse({
             "status": "completed",
             "summary": doc["summary"]
         })
     except Exception as e:
-        raise HTTPException(500, f"Summarization failed: {str(e)}")
-
-
-
+        raise HTTPException(500, f"summarization failed: {str(e)}")
 
 @app.post("/api/translate/{doc_id}")
 def get_translation(doc_id: str, request: TranslationRequest = Body(...)):
-    """Handle translation requests"""
     doc = document_store.get(doc_id)
     if not doc:
-        raise HTTPException(404, "Document not found")
+        raise HTTPException(404, "document not found")
 
     try:
-        if request.target_lang not in doc["translations"]:
+        translation_key = f"summary_{request.target_lang}"
+        if translation_key not in doc["translations"]:
             try:
-                translated_text = translate_text_core(
-                    doc["text"],
+                translated_summary = translate_text_core(
+                    doc["summary"],
                     request.target_lang
                 )
-                doc["translations"][request.target_lang] = translated_text
+                doc["translations"][translation_key] = translated_summary
             except ValueError as e:
-                raise HTTPException(400, detail=str(e))
+                raise HTTPException(400, detail=f"invalid language: {str(e)}")
             except RuntimeError as e:
-                raise HTTPException(500, detail=str(e))
+                raise HTTPException(500, detail=f"translation service error: {str(e)}")
+            except Exception as e:
+                raise HTTPException(500, detail=f"translation error: {str(e)}")
 
-        return PlainTextResponse(
-            content=doc["translations"][request.target_lang],
-            headers={
-                "Content-Disposition":
-                    f"attachment; filename={doc['filename']}_{request.target_lang}_translation.txt"
-            }
-        )
+        return JSONResponse({
+            "translated_summary": doc["translations"][translation_key]
+        })
     except Exception as e:
-        raise HTTPException(500, f"Translation failed: {str(e)}")
-
+        raise HTTPException(500, f"translation failed: {str(e)}")
 
 @app.post("/api/qa/{doc_id}")
-def answer_question(doc_id: str, request: QAResponse = Body(...)):
-    """Handle QA requests"""
+def answer_question(doc_id: str, request: QARequest = Body(...)):
     doc = document_store.get(doc_id)
     if not doc:
-        raise HTTPException(404, "Document not found")
+        raise HTTPException(404, "document not found")
 
     try:
-        # Lazy-load FAISS index
-        if not doc["faiss_index"]:
-            doc["faiss_index"] = create_faiss_index(doc["text"])
-
         qa = initialize_qa_system(doc["faiss_index"])
 
         with torch.inference_mode():
@@ -196,23 +166,48 @@ def answer_question(doc_id: str, request: QAResponse = Body(...)):
             "sources": [d.page_content[:200] + "..." for d in result["source_documents"]]
         })
     except Exception as e:
-        raise HTTPException(500, f"QA failed: {str(e)}")
+        raise HTTPException(500, f"qa failed: {str(e)}")
 
-# @app.on_event("startup")
-# async def startup_event():
-#     """Initialize models on startup"""
-#     try:
-#         # Warm up models
-#         dummy_text = "This is a test document."
-#         summarize_text_optimized(dummy_text)
-#         translate_text_core(dummy_text, "es")
-#
-#         if torch.cuda.is_available():
-#             torch.cuda.empty_cache()
-#             print(f"GPU Memory allocated: {torch.cuda.memory_allocated() / 1024 ** 3:.1f}GB")
-#     except Exception as e:
-#         print(f"Startup error: {str(e)}")
+@app.delete("/api/delete/{doc_id}")
+def delete_document(doc_id: str):
+    """Delete a document from the system and remove associated files"""
+    doc = document_store.get(doc_id)
+    if not doc:
+        raise HTTPException(404, "document not found")
 
+    try:
+        # Find and delete the physical file
+        for file_path in UPLOAD_DIR.glob(f"{doc_id}.*"):
+            if file_path.exists():
+                file_path.unlink()
+                print(f"deleted file: {file_path}")
+
+        # Remove from document store
+        del document_store[doc_id]
+        
+        return JSONResponse({
+            "message": "document deleted successfully",
+            "doc_id": doc_id,
+            "filename": doc["filename"]
+        })
+    except Exception as e:
+        raise HTTPException(500, f"deletion failed: {str(e)}")
+
+@app.get("/api/files")
+def list_all_files():
+    """Get a list of all uploaded files"""
+    files_list = []
+    for doc_id, doc_data in document_store.items():
+        files_list.append({
+            "doc_id": doc_id,
+            "filename": doc_data["filename"],
+            "upload_date": doc_data["created_at"]
+        })
+    
+    return JSONResponse({
+        "files": files_list,
+        "count": len(files_list)
+    })
 
 if __name__ == "__main__":
     import uvicorn
